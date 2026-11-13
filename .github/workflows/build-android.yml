@@ -1,0 +1,206 @@
+# Builds a debug APK of Quest 64 Recompiled for Android (see README.md).
+# RUN THIS ONLY IN A PRIVATE REPOSITORY: it needs ROM-derived generated sources (release asset
+# "android-generated-sources", made with tools/generate-sources.sh) and the APK it produces contains game code
+# derived from your ROM. The first step refuses to run in a public repository.
+name: Build Android APK
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-android.yml', '*.patch', '*.py', '*.sh', 'icons/**', 'tools/**']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Build the signed release APK (needs the Q64_RELEASE_* secrets) instead of the debug APK'
+        type: boolean
+        default: false
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  ENGINE_REPO: zmarotrix/Quest64-Recomp
+  ENGINE_SHA: e5a3b991e82a87e87c49e4b5f05b182403e541e6
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Refuse to run in a public repository
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "::error::This workflow builds an APK containing ROM-derived code. Run it in a PRIVATE repository only."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch engine source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://github.com/${ENGINE_REPO}.git" engine
+          cd engine
+          git checkout --quiet "$ENGINE_SHA"
+          git submodule update --init --depth 1 lib/RmlUi lib/lunasvg lib/sse2neon lib/sf64decomp lib/cpp-httplib Quest64Syms
+          git submodule update --init --depth 1 lib/N64ModernRuntime
+          git -C lib/N64ModernRuntime submodule update --init --recursive --depth 1
+          git submodule update --init --depth 1 lib/rt64
+          git -C lib/rt64 submodule update --init --recursive --depth 1
+
+      - name: Apply Android patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd engine
+          patch -p1 < ../quest64-android-app.patch
+          patch -p1 < ../quest64-android-slotmap.patch
+          python3 -I ../adapt-app-autostart.py .
+          (cd lib/N64ModernRuntime && patch -p1 < ../../../quest64-android-runtime-mods.patch)
+          (cd lib/N64ModernRuntime && patch -p1 < ../../../quest64-android-runtime-resolution.patch)
+          python3 -I ../adapt-runtime-mprotect.py lib/N64ModernRuntime
+          (cd lib/N64ModernRuntime && patch -p1 < ../../../quest64-android-runtime-savestates.patch)
+          bash ../adapt-rt64.sh lib/rt64
+
+      - name: Add the Android project from the Zelda fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash fetch-overlay.sh
+          O=overlay
+          cp -r "$O/android" engine/android
+          mkdir -p engine/src engine/tools
+          cp -r "$O/src/android" engine/src/android
+          cp -r "$O/tools/ci" engine/tools/ci
+          bash adapt-overlay.sh engine
+          python3 -I adapt-app-audio.py engine
+
+      - name: Download generated sources (private release asset)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download android-generated-sources -p quest64-generated-sources.zip -D "$RUNNER_TEMP" --repo "$GITHUB_REPOSITORY"
+          python3 - "$RUNNER_TEMP/quest64-generated-sources.zip" engine <<'PY'
+          import pathlib, sys, zipfile
+          bundle, dest = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
+          allowed = {"RecompiledFuncs", "RecompiledPatches", "rsp"}
+          with zipfile.ZipFile(bundle) as z:
+              for i in z.infolist():
+                  n = pathlib.PurePosixPath(i.filename)
+                  if i.is_dir():
+                      continue
+                  if n.is_absolute() or ".." in n.parts or not n.parts or n.parts[0] not in allowed:
+                      raise SystemExit(f"Refusing unsafe archive path: {i.filename}")
+              z.extractall(dest)
+          PY
+          test -f engine/rsp/aspMain.cpp && test -f engine/RecompiledPatches/patches.c && ls engine/RecompiledFuncs | head -3
+
+      - name: Install host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang lld ninja-build zip unzip xz-utils
+          echo "PATCHES_C_COMPILER=$(command -v clang)" >> "$GITHUB_ENV"
+          echo "PATCHES_LD=$(command -v ld.lld)" >> "$GITHUB_ENV"
+          echo "ANDROID_PREFIX_ROOT=${GITHUB_WORKSPACE}/.android-prefixes" >> "$GITHUB_ENV"
+          echo "ZELDA_ANDROID_FILE_TO_C=${RUNNER_TEMP}/file-to-c" >> "$GITHUB_ENV"
+          echo "ZELDA_ANDROID_SDL2_PREFIX=${GITHUB_WORKSPACE}/.android-prefixes/SDL2-2.32.10-android-arm64" >> "$GITHUB_ENV"
+          echo "ZELDA_ANDROID_FREETYPE_PREFIX=${GITHUB_WORKSPACE}/.android-prefixes/freetype-2.13.3-android-arm64" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.1'
+
+      - name: Install Android packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner image already has the Android SDK; use its sdkmanager directly.
+          : "${ANDROID_HOME:=/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)"
+          echo "Using $SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          set -o pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "cmake;3.30.3" "ndk;26.0.10792818"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.0.10792818" >> "$GITHUB_ENV"
+
+      - name: Cache Android native dependency prefixes
+        uses: actions/cache@v4
+        with:
+          path: .android-prefixes
+          key: android-prefixes-${{ runner.os }}-sdl2-2.32.10-freetype-2.13.3-ndk-26.0.10792818
+
+      - name: Build SDL2 and Freetype for Android
+        working-directory: engine
+        run: bash tools/ci/setup_android_deps.sh
+
+      - name: Build host file_to_c helper
+        working-directory: engine
+        run: c++ -std=c++17 -O2 lib/rt64/src/tools/file_to_c/file_to_c.cpp -o "$ZELDA_ANDROID_FILE_TO_C"
+
+      - name: Debug signing key
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.Q64_DEBUG_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          # Optional secret keeps the same key across builds, so each APK installs over the previous one.
+          # Without it a fresh key is made (uninstall the old app before installing a new build).
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/debug.p12"
+          else
+            keytool -genkeypair -keystore "$RUNNER_TEMP/debug.p12" -storetype pkcs12 -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          echo "Q64_DEBUG_KEYSTORE=$RUNNER_TEMP/debug.p12" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: engine
+        env:
+          APP_ID: ${{ vars.Q64_APP_ID || 'org.quest64recomp.android' }}
+          RELEASE: ${{ inputs.release }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.Q64_RELEASE_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.Q64_RELEASE_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.Q64_RELEASE_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.Q64_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE" = "true" ]; then
+            test -n "$ANDROID_KEYSTORE_B64" || { echo "::error::Release build needs the Q64_RELEASE_* secrets"; exit 1; }
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.p12"
+            gradle --no-daemon -p android :app:assembleRelease -PzeldaProbe=false -PzeldaApplicationId="${APP_ID}"
+            echo "APK_DIR=android/app/build/outputs/apk/release" >> "$GITHUB_ENV"
+          else
+            gradle --no-daemon -p android :app:assembleDebug -PzeldaProbe=false -PzeldaApplicationId="${APP_ID}"
+            echo "APK_DIR=android/app/build/outputs/apk/debug" >> "$GITHUB_ENV"
+          fi
+
+      - name: Locate APK
+        id: apk
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          apk="$(find "$APK_DIR" -name '*.apk' | head -n 1)"
+          test -n "$apk"
+          echo "path=engine/$apk" >> "$GITHUB_OUTPUT"
+          ls -la "$apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Quest64-Recompiled-Android-debug
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14

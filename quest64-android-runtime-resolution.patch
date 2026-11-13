@@ -1,0 +1,22 @@
+diff --git a/ultramodern/include/ultramodern/config.hpp b/ultramodern/include/ultramodern/config.hpp
+index a8cd8e0..c2375d6 100644
+--- a/ultramodern/include/ultramodern/config.hpp
++++ b/ultramodern/include/ultramodern/config.hpp
+@@ -12,6 +12,8 @@ namespace ultramodern {
+             Original,
+             Original2x,
+             Auto,
++            P720,
++            P1080,
+             OptionCount
+         };
+         enum class WindowMode {
+@@ -84,6 +86,8 @@ namespace ultramodern {
+             {ultramodern::renderer::Resolution::Original, "Original"},
+             {ultramodern::renderer::Resolution::Original2x, "Original2x"},
+             {ultramodern::renderer::Resolution::Auto, "Auto"},
++            {ultramodern::renderer::Resolution::P720, "720p"},
++            {ultramodern::renderer::Resolution::P1080, "1080p"},
+         });
+ 
+         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::WindowMode, {
